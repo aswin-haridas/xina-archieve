@@ -40,7 +40,8 @@ app.post("/api/chat", async (req, res) => {
 
   const systemPrompt = {
     role: "system",
-    content: "You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic."
+    content:
+      "You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic.",
   };
 
   const messagesWithSystem = [systemPrompt, ...messages];
