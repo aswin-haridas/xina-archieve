@@ -2,7 +2,9 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
+const path = require("path");
 const fs = require("fs");
+const { getMemories, invalidateMemoryCache } = require("./brain");
 const app = express();
 const port = 3000;
 
@@ -31,8 +33,23 @@ app.get("/api/history", (req, res) => {
   }
 });
 
+app.post("/api/reset", (req, res) => {
+  try {
+    if (fs.existsSync("history.jsonl")) {
+      fs.unlinkSync("history.jsonl");
+    }
+    invalidateMemoryCache();
+    res.json({ message: "Chat history reset" });
+  } catch (error) {
+    console.error("Error resetting history:", error.message);
+    res.status(500).json({ error: "Failed to reset history" });
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
+
+  const memories = getMemories(messages);
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "Invalid message format" });
@@ -40,8 +57,9 @@ app.post("/api/chat", async (req, res) => {
 
   const systemPrompt = {
     role: "system",
-    content:
-      "You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic.",
+    content: `You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic.
+    
+${memories.length > 0 ? "Here is some relevant context from previous conversations:\n" + memories.map((m) => "- " + m).join("\n") : ""}`,
   };
 
   const messagesWithSystem = [systemPrompt, ...messages];
@@ -67,7 +85,7 @@ app.post("/api/chat", async (req, res) => {
     if (checkResponse.choices && checkResponse.choices.length > 0) {
       const aiMessage = checkResponse.choices[0].message;
 
-      // Save history to JSONL
+      // Save history to JSONL (Short Term Memory)
       const lastUserMessage = messages[messages.length - 1];
       const historyEntry = {
         timestamp: new Date().toISOString(),
@@ -75,16 +93,24 @@ app.post("/api/chat", async (req, res) => {
       };
       fs.appendFileSync("history.jsonl", JSON.stringify(historyEntry) + "\n");
 
-      // Save user prompt to Markdown file (Daily Log)
+      // Save user prompt to Markdown file (Long Term Memory)
       if (lastUserMessage && lastUserMessage.role === "user") {
         const now = new Date();
         const dateStr = now.toISOString().split("T")[0]; // YYYY-MM-DD
-        const mdFilename = `${dateStr}.md`;
+        const memoriesDir = path.resolve(__dirname, "memories");
+
+        if (!fs.existsSync(memoriesDir)) {
+          fs.mkdirSync(memoriesDir);
+        }
+
+        const mdFilename = path.join(memoriesDir, `${dateStr}.md`);
         const mdContent = `\n## Prompt at ${now.toISOString()}\n\n${
           lastUserMessage.content
         }\n\n---\n`;
         fs.appendFileSync(mdFilename, mdContent);
       }
+
+      invalidateMemoryCache();
 
       res.json({ message: aiMessage });
     } else {
