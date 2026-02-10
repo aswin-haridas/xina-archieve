@@ -38,12 +38,19 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "Invalid message format" });
   }
 
+  const systemPrompt = {
+    role: "system",
+    content: "You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic."
+  };
+
+  const messagesWithSystem = [systemPrompt, ...messages];
+
   try {
     const response = await axios.post(
       API_URL,
       {
         model: MODEL,
-        messages: messages,
+        messages: messagesWithSystem,
       },
       {
         headers: {
@@ -66,6 +73,17 @@ app.post("/api/chat", async (req, res) => {
         messages: [lastUserMessage, aiMessage],
       };
       fs.appendFileSync("history.jsonl", JSON.stringify(historyEntry) + "\n");
+
+      // Save user prompt to Markdown file (Daily Log)
+      if (lastUserMessage && lastUserMessage.role === "user") {
+        const now = new Date();
+        const dateStr = now.toISOString().split("T")[0]; // YYYY-MM-DD
+        const mdFilename = `${dateStr}.md`;
+        const mdContent = `\n## Prompt at ${now.toISOString()}\n\n${
+          lastUserMessage.content
+        }\n\n---\n`;
+        fs.appendFileSync(mdFilename, mdContent);
+      }
 
       res.json({ message: aiMessage });
     } else {
