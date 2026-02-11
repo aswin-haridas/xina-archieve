@@ -13,7 +13,7 @@ app.use(express.json());
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 const API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "openrouter/pony-alpha";
+const MODEL = "stepfun/step-3.5-flash:free";
 
 app.get("/api/history", (req, res) => {
   try {
@@ -112,7 +112,7 @@ ${memories.length > 0 ? "Here is some relevant context from previous conversatio
 
       invalidateMemoryCache();
 
-      res.json({ message: aiMessage });
+      res.json({ message: aiMessage, memories });
     } else {
       res.status(500).json({ error: "No response from AI" });
     }
