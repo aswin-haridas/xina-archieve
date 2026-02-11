@@ -1,131 +1,60 @@
-require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const axios = require("axios");
-const path = require("path");
-const fs = require("fs");
 const { getMemories, invalidateMemoryCache } = require("./brain");
-const app = express();
-const port = 3000;
+const { completion } = require("./lib/llm");
+const { saveMemory } = require("./lib/storage");
+const { SYSTEM_PROMPT } = require("./lib/prompts");
+const { PORT } = require("./lib/config");
 
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-const API_KEY = process.env.OPENROUTER_API_KEY;
-const API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "stepfun/step-3.5-flash:free";
-
-app.get("/api/history", (req, res) => {
-  try {
-    if (!fs.existsSync("history.jsonl")) {
-      return res.json({ history: [] });
-    }
-    const data = fs.readFileSync("history.jsonl", "utf8");
-    const history = data
-      .trim()
-      .split("\n")
-      .filter((line) => line)
-      .map((line) => JSON.parse(line));
-    res.json({ history });
-  } catch (error) {
-    console.error("Error reading history:", error.message);
-    res.status(500).json({ error: "Failed to load history" });
-  }
-});
+app.get("/api/history", (req, res) => res.json({ history: [] }));
 
 app.post("/api/reset", (req, res) => {
-  try {
-    if (fs.existsSync("history.jsonl")) {
-      fs.unlinkSync("history.jsonl");
-    }
-    invalidateMemoryCache();
-    res.json({ message: "Chat history reset" });
-  } catch (error) {
-    console.error("Error resetting history:", error.message);
-    res.status(500).json({ error: "Failed to reset history" });
-  }
+  invalidateMemoryCache();
+  res.json({ message: "Chat context reset" });
 });
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
-
-  const memories = getMemories(messages);
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "Invalid message format" });
-  }
-
-  const systemPrompt = {
-    role: "system",
-    content: `You are a helpful assistant. Keep responses concise and natural. Talk like a human - be direct, skip formalities, and get to the point. Use casual language when appropriate. Avoid being overly verbose or robotic.
-    
-${memories.length > 0 ? "Here is some relevant context from previous conversations:\n" + memories.map((m) => "- " + m).join("\n") : ""}`,
-  };
-
-  const messagesWithSystem = [systemPrompt, ...messages];
+  if (!messages?.length)
+    return res.status(400).json({ error: "Invalid messages" });
 
   try {
-    const response = await axios.post(
-      API_URL,
-      {
-        model: MODEL,
-        messages: messagesWithSystem,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          "Content-Type": "application/json",
-          "HTTP-Referer": "https://github.com/Start-Context/xina-cli", // Update if needed
-          "X-Title": "Xina Chat",
-        },
-      },
-    );
+    const memories = await getMemories(messages);
+    const systemContent = SYSTEM_PROMPT(memories);
 
-    const checkResponse = response.data;
-    if (checkResponse.choices && checkResponse.choices.length > 0) {
-      const aiMessage = checkResponse.choices[0].message;
+    // Create messages array with system prompt first
+    const chatMessages = [
+      { role: "system", content: systemContent },
+      ...messages,
+    ];
 
-      // Save history to JSONL (Short Term Memory)
-      const lastUserMessage = messages[messages.length - 1];
-      const historyEntry = {
-        timestamp: new Date().toISOString(),
-        messages: [lastUserMessage, aiMessage],
-      };
-      fs.appendFileSync("history.jsonl", JSON.stringify(historyEntry) + "\n");
+    // Call LLM
+    // We modify completion to accept messages array directly since we construct it here
+    // Wait, let's fix llm.js to be flexible or follow existing pattern
+    // Existing pattern in llm.js: expects (systemPrompt, userMessages)
+    // But we want to pass the whole array including system prompt because we constructed it here
+    // Let's adjust llm.js after this or adjust usage here.
+    // Actually, llm.js expects (systemPrompt, userMessages) and constructs [system, ...user].
+    // So distinct args:
+    const aiMessage = await completion(systemContent, messages);
 
-      // Save user prompt to Markdown file (Long Term Memory)
-      if (lastUserMessage && lastUserMessage.role === "user") {
-        const now = new Date();
-        const dateStr = now.toISOString().split("T")[0]; // YYYY-MM-DD
-        const memoriesDir = path.resolve(__dirname, "memories");
-
-        if (!fs.existsSync(memoriesDir)) {
-          fs.mkdirSync(memoriesDir);
-        }
-
-        const mdFilename = path.join(memoriesDir, `${dateStr}.md`);
-        const mdContent = `\n## Prompt at ${now.toISOString()}\n\n${
-          lastUserMessage.content
-        }\n\n---\n`;
-        fs.appendFileSync(mdFilename, mdContent);
+    if (aiMessage) {
+      const lastUser = messages[messages.length - 1];
+      if (lastUser?.role === "user") {
+        saveMemory(lastUser.content, aiMessage.content);
       }
-
-      invalidateMemoryCache();
-
       res.json({ message: aiMessage, memories });
     } else {
       res.status(500).json({ error: "No response from AI" });
     }
   } catch (error) {
-    console.error("Error calling OpenRouter:", error.message);
-    if (error.response) {
-      res.status(error.response.status).json({ error: error.response.data });
-    } else {
-      res.status(500).json({ error: "Internal Server Error" });
-    }
+    console.error("Chat Error:", error.message);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-app.listen(port, () => {
-  console.log(`Server is running heavily on port ${port}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

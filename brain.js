@@ -3,221 +3,261 @@ const path = require("path");
 const lancedb = require("@lancedb/lancedb");
 const { pipeline } = require("@xenova/transformers");
 
+// --- Configuration ---
+const DB_PATH = "data/lancedb";
+const TABLE_NAME = "memories";
+const MEMORIES_DIR = path.resolve(__dirname, "memories");
+const INDEX_META_FILE = path.join(path.dirname(DB_PATH), "index_meta.json");
+
+// OpenClaw-style chunking config
+const CHUNK_SIZE = 1500; // ~400 tokens
+const CHUNK_OVERLAP = 200;
+
+// --- Singleton State ---
 let db = null;
 let table = null;
 let embedder = null;
 let initializationPromise = null;
 
-const DB_PATH = "data/lancedb";
-const TABLE_NAME = "memories";
+// --- Helper: Sliding Window Chunker ---
+function chunkText(text, source, type) {
+  if (!text || text.trim().length === 0) return [];
 
-// Initialize LanceDB and Embedder (Singleton Pattern)
+  // Normalize newlines
+  const normalized = text.replace(/\r\n/g, "\n");
+  const chunks = [];
+  let start = 0;
+
+  // Single chunk if small
+  if (normalized.length <= CHUNK_SIZE) {
+    return [
+      {
+        text: normalized.trim(),
+        source,
+        type,
+        timestamp: Date.now(),
+        id: `${source}-${Date.now()}-0`,
+      },
+    ];
+  }
+
+  let i = 0;
+  while (start < normalized.length) {
+    let end = start + CHUNK_SIZE;
+
+    // Try to break at a newline or space near the end
+    if (end < normalized.length) {
+      const lastNewline = normalized.lastIndexOf("\n", end);
+      const lastSpace = normalized.lastIndexOf(" ", end);
+
+      if (lastNewline > start + CHUNK_SIZE * 0.5) {
+        end = lastNewline;
+      } else if (lastSpace > start + CHUNK_SIZE * 0.5) {
+        end = lastSpace;
+      }
+    }
+
+    const chunkContent = normalized.slice(start, end).trim();
+    if (chunkContent.length > 50) {
+      // Filter tiny noise
+      chunks.push({
+        text: chunkContent,
+        source,
+        type, // 'daily' or 'fact' (long_term)
+        timestamp: Date.now(),
+        id: `${source}-${Date.now()}-${i}`,
+      });
+    }
+
+    // Move start forward, minus overlap
+    start = end - CHUNK_OVERLAP;
+    // ensure progress
+    if (start >= normalized.length) break;
+    i++;
+  }
+  return chunks;
+}
+
+// --- Init Brain ---
 async function initBrain() {
   if (initializationPromise) return initializationPromise;
 
   initializationPromise = (async () => {
     try {
-      // 1. Initialize Embedder
+      // 1. Load Embedder
       if (!embedder) {
-        console.log("Loading embedding model...");
+        console.log("🧠 Loading embedding model...");
         embedder = await pipeline(
           "feature-extraction",
           "Xenova/all-MiniLM-L6-v2",
         );
       }
 
-      // 2. Initialize Database
+      // 2. Load DB
       if (!db) {
         const dbDir = path.dirname(DB_PATH);
-        if (!fs.existsSync(dbDir)) {
-          fs.mkdirSync(dbDir, { recursive: true });
-        }
+        if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
         db = await lancedb.connect(DB_PATH);
       }
 
-      // 3. Create or Open Table
-      // Schema is inferred from the data: { vector: number[], text: string, source: string, timestamp: number }
+      // 3. Load Table
       const existingTables = await db.tableNames();
-
       if (existingTables.includes(TABLE_NAME)) {
         table = await db.openTable(TABLE_NAME);
       } else {
-        // Create with dummy data to set schema, then delete it?
-        // LanceDB requires data to create a table. We'll handle this in syncMemories.
-        console.log(
-          "Memory table does not exist yet. It will be created on first sync.",
-        );
+        // We defer creation until we have data, or create empty if schema allows
       }
 
-      // 4. Initial Sync of Memories
+      // 4. Trigger Sync
       await syncMemories();
 
-      console.log("Brain initialized successfully.");
+      console.log("✅ Brain initialized.");
     } catch (error) {
-      console.error("Failed to initialize brain:", error);
-      initializationPromise = null; // Reset on failure so we can retry
+      console.error("❌ Failed to initialize brain:", error.message);
+      initializationPromise = null;
     }
   })();
   return initializationPromise;
 }
 
-// Generate embedding for text
+// --- Embed Helper ---
 async function getEmbedding(text) {
-  await initBrain();
+  if (!embedder) await initBrain();
   const output = await embedder(text, { pooling: "mean", normalize: true });
   return Array.from(output.data);
 }
 
-// Sync file-based memories to Vector DB
+// --- Sync Logic (Incremental) ---
 async function syncMemories() {
-  console.log("Syncing memories to Vector DB...");
-  const memories = [];
-  const now = Date.now();
+  if (!fs.existsSync(MEMORIES_DIR)) return;
 
-  // 1. Load Long Term Memory (Markdown Files)
-  const memoriesDir = path.resolve(__dirname, "memories");
-  if (fs.existsSync(memoriesDir)) {
-    const files = fs.readdirSync(memoriesDir).filter((f) => f.endsWith(".md"));
-    for (const file of files) {
-      const content = fs.readFileSync(path.join(memoriesDir, file), "utf8");
-      const chunks = content.split(/\n\s*\n/);
-      for (const chunk of chunks) {
-        const cleanChunk = chunk.replace(/^#+\s.*$/gm, "").trim();
-        if (cleanChunk.length > 10 && !cleanChunk.startsWith("---")) {
-          memories.push({
-            text: cleanChunk,
-            source: "[Long Term Memory]",
-            timestamp: now,
-            id: `ltm-${file}-${memories.length}`, // Simple unique ID
-          });
-        }
-      }
+  // Load Metadata
+  let meta = {};
+  if (fs.existsSync(INDEX_META_FILE)) {
+    try {
+      meta = JSON.parse(fs.readFileSync(INDEX_META_FILE, "utf8"));
+    } catch (e) {}
+  }
+
+  const files = fs.readdirSync(MEMORIES_DIR).filter((f) => f.endsWith(".md"));
+  const newChunks = [];
+  let hasUpdates = false;
+
+  console.log(`📂 Checking ${files.length} memory files for updates...`);
+
+  for (const file of files) {
+    const filePath = path.join(MEMORIES_DIR, file);
+    const stats = fs.statSync(filePath);
+
+    // Check if modified since last sync
+    if (!meta[file] || meta[file] < stats.mtimeMs) {
+      console.log(`re-indexing: ${file}`);
+      const content = fs.readFileSync(filePath, "utf8");
+
+      const type = file === "MEMORY.md" ? "fact" : "daily";
+      const chunks = chunkText(content, file, type);
+      newChunks.push(...chunks);
+
+      meta[file] = stats.mtimeMs;
+      hasUpdates = true;
     }
   }
 
-  // 2. Load Short Term Memory (History JSONL)
-  const historyPath = path.resolve(__dirname, "history.jsonl");
-  if (fs.existsSync(historyPath)) {
-    const data = fs.readFileSync(historyPath, "utf8");
-    const lines = data.trim().split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      try {
-        const entry = JSON.parse(lines[i]);
-        entry.messages.forEach((msg) => {
-          if (msg.role === "user") {
-            // Focus on user messages for now, or important assistant info
-            const parts = msg.content.match(/[^.!?]+[.!?]+/g) || [msg.content];
-            parts.forEach((part) => {
-              const cleanPart = part.trim();
-              if (cleanPart.length > 10) {
-                memories.push({
-                  text: cleanPart,
-                  source: "[Short Term Memory]",
-                  timestamp: now,
-                  id: `stm-${i}-${memories.length}`,
-                });
-              }
-            });
-          }
-        });
-      } catch (e) {}
-    }
-  }
+  if (!hasUpdates) return;
 
-  if (memories.length === 0) return;
-
-  // Generate embeddings for all memories
-  // In a real app, strict diffing would be better to avoid re-embedding everything.
-  // For now, we'll overwrite the table to keep it simple and perfectly synced.
-
-  /* BATCH PROCESSING */
-  const BATCH_SIZE = 5; // Reduced batch size just in case locally
+  // Process new chunks
+  console.log(`embedding ${newChunks.length} new chunks...`);
   const data = [];
+  const BATCH_SIZE = 10;
 
-  if (!embedder) await initBrain();
-
-  for (let i = 0; i < memories.length; i += BATCH_SIZE) {
-    const batch = memories.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((m) => m.text);
+  for (let i = 0; i < newChunks.length; i += BATCH_SIZE) {
+    const batch = newChunks.slice(i, i + BATCH_SIZE);
+    const texts = batch.map((c) => c.text);
 
     try {
       const output = await embedder(texts, {
         pooling: "mean",
         normalize: true,
       });
-
-      // Output from batch is a Tensor with shape [batch_size, 384]
-      // We can use .tolist() to get array of arrays
       const embeddings = output.tolist();
 
-      batch.forEach((mem, idx) => {
+      batch.forEach((chunk, idx) => {
         data.push({
           vector: embeddings[idx],
-          text: mem.text,
-          source: mem.source,
-          timestamp: mem.timestamp,
+          text: chunk.text,
+          source: chunk.source,
+          type: chunk.type,
+          timestamp: chunk.timestamp,
         });
       });
-
-      console.log(
-        `Processed batch ${Math.floor(i / BATCH_SIZE) + 1} (${Math.min(i + BATCH_SIZE, memories.length)}/${memories.length})`,
-      );
     } catch (e) {
-      console.error("Batch failed:", e);
+      console.error("Error embedding batch:", e);
     }
   }
-  console.log("Finished embedding all memories.");
 
   if (data.length > 0) {
-    if (table) {
-      // Drop and recreate to "sync" (simplest approach for now)
-      try {
-        await db.dropTable(TABLE_NAME);
-      } catch (e) {
-        console.log("Table might not exist to drop:", e.message);
-      }
+    if (!table) {
+      // Create table
+      table = await db.createTable(TABLE_NAME, data);
+    } else {
+      await table.add(data);
     }
-    console.log("Creating table...");
-    table = await db.createTable(TABLE_NAME, data);
-    console.log(`Synced ${data.length} memories to LanceDB.`);
+    // Save metadata only after success
+    fs.writeFileSync(INDEX_META_FILE, JSON.stringify(meta, null, 2));
+    console.log(`Synced ${data.length} chunks to LanceDB.`);
   }
 }
 
-// Invalidate cache doesn't apply the same way, but we can expose a re-sync
-function invalidateMemoryCache() {
-  // Trigger a background sync
-  syncMemories().catch(console.error);
-}
-
-// Search memories
+// --- Retrieval (Hybrid-ish) ---
 async function getMemories(messages) {
   if (!messages || messages.length === 0) return [];
+  const lastMsg = messages[messages.length - 1];
+  if (lastMsg.role !== "user") return [];
 
-  const lastMessage = messages[messages.length - 1];
-  if (lastMessage.role !== "user") return [];
-
-  const query = lastMessage.content;
+  const query = lastMsg.content;
 
   try {
     await initBrain();
-    if (!table) return []; // Still no table (no memories yet)
+    if (!table) return [];
 
-    const queryVector = await getEmbedding(query);
+    // 1. Vector Search
+    const queryVec = await getEmbedding(query);
+    const results = await table.search(queryVec).limit(5).toArray();
 
-    // Semantic Search
-    const results = await table.search(queryVector).limit(3).toArray();
+    console.log(
+      `[Brain] Search for "${query}" -> Found ${results.length} matches`,
+    );
+    if (results.length > 0) {
+      console.log(
+        `[Brain] Top match snippet: ${results[0].text.substring(0, 100)}...`,
+      );
+    }
 
-    // results is now an array of objects straight away
-    const relevant = results.map((r) => `${r.source}: ${r.text}`);
-    console.log("Found related memories (LanceDB):", relevant);
-    return relevant;
-  } catch (error) {
-    console.error("Error searching memories:", error);
+    // 2. Keyword Boost (Simple)
+    // Logic: If a result is type='fact' (MEMORY.md), it's high priority.
+
+    const sorted = results.sort((a, b) => {
+      if (a.type === "fact" && b.type !== "fact") return -1;
+      if (b.type === "fact" && a.type !== "fact") return 1;
+      return 0; // maintain vector rank
+    });
+
+    return sorted.map((r) => {
+      const prefix =
+        r.type === "fact" ? "🧠 [CORE MEMORY]" : `📜 [History: ${r.source}]`;
+      return `${prefix}\n${r.text}`;
+    });
+  } catch (err) {
+    console.error("Search failed:", err);
     return [];
   }
 }
 
-// Start initialization immediately
-initBrain();
+function invalidateMemoryCache() {
+  syncMemories().catch(console.error);
+}
 
 module.exports = { getMemories, invalidateMemoryCache };
+
+// Start initialization immediately
+initBrain();
